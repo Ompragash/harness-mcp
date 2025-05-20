@@ -148,12 +148,16 @@ func normalizeGitURL(url string) string {
 
 // findMatchingExecutionAndGetLogs finds executions that match the Git context and returns failure logs
 func findMatchingExecutionAndGetLogs(ctx context.Context, client *client.Client, scope dto.Scope, gitInfo *GitInfo, maxPages int) (*dto.FailureLogResponse, error) {
+	// Start with a small page size to quickly find recent failures
+	pageSize := 5
+	seenExecutions := make(map[string]bool)
+
 	for page := 0; page < maxPages; page++ {
 		// List pipeline executions with pagination
 		opts := &dto.PipelineExecutionOptions{
 			PaginationOptions: dto.PaginationOptions{
 				Page: page,
-				Size: 5, // Fetch 5 executions per page
+				Size: pageSize,
 			},
 		}
 
@@ -169,71 +173,77 @@ func findMatchingExecutionAndGetLogs(ctx context.Context, client *client.Client,
 
 		// Check each execution for matching Git context
 		for _, execution := range executions.Data.Content {
-			if isMatchingExecution(execution, gitInfo) && execution.Status == "Failed" {
+			// Skip if we've already checked this execution
+			if seenExecutions[execution.PlanExecutionId] {
+				continue
+			}
+			seenExecutions[execution.PlanExecutionId] = true
+
+			if isMatchingExecution(execution, gitInfo) {
 				return getFailureLogsForExecution(ctx, client, scope, execution.PlanExecutionId)
 			}
 		}
 
-		// Stop pagination if we've reached the last page
-		if executions.Data.Last {
+		// If we've seen all available pages, stop
+		if executions.Data.Last || len(executions.Data.Content) < pageSize {
 			break
+		}
+
+		// Increase page size for subsequent requests to reduce API calls
+		if page == 0 {
+			pageSize = 20
 		}
 	}
 
-	return nil, fmt.Errorf("no matching failed execution found")
+	return nil, fmt.Errorf("no matching failed execution found after checking %d pages", maxPages)
 }
 
-// isMatchingExecution checks if a pipeline execution matches the Git context
+// isMatchingExecution checks if an execution matches the given Git info
 func isMatchingExecution(execution dto.PipelineExecution, gitInfo *GitInfo) bool {
-	// Extract CI module info if available
+	// Skip non-failed executions
+	if execution.Status != "Failed" {
+		return false
+	}
+
+	// Extract CI module info
 	ciInfo, ok := execution.ModuleInfo["ci"]
 	if !ok {
 		return false
 	}
 
-	// Extract data from the CI module info map
 	ciMap, ok := ciInfo.(map[string]interface{})
 	if !ok {
 		return false
 	}
 
-	// Try to match by branch
-	branch, _ := ciMap["branch"].(string)
-	if branch != "" && branch == gitInfo.Branch {
-		return true
-	}
-
-	// Try to match by repo URL
+	// Get SCM details
 	scmDetailsList, ok := ciMap["scmDetailsList"].([]interface{})
-	if ok && len(scmDetailsList) > 0 {
-		scmDetails, ok := scmDetailsList[0].(map[string]interface{})
-		if ok {
-			scmURL, _ := scmDetails["scmUrl"].(string)
-			if scmURL != "" && strings.Contains(normalizeGitURL(scmURL), gitInfo.RepoURL) {
-				return true
-			}
-		}
+	if !ok || len(scmDetailsList) == 0 {
+		return false
 	}
 
-	// Check for commits in ciExecutionInfoDTO
-	ciExecutionInfo, ok := ciMap["ciExecutionInfoDTO"].(map[string]interface{})
-	if ok {
-		branch, ok := ciExecutionInfo["branch"].(map[string]interface{})
-		if ok {
-			commits, ok := branch["commits"].([]interface{})
-			if ok && len(commits) > 0 {
-				commit, ok := commits[0].(map[string]interface{})
-				if ok {
-					commitID, _ := commit["id"].(string)
-					if commitID == gitInfo.CommitHash {
-						return true
-					}
-				}
-			}
-		}
+	// Get first SCM details
+	scmDetails, ok := scmDetailsList[0].(map[string]interface{})
+	if !ok {
+		return false
 	}
 
-	return false
+	// Get SCM URL
+	scmURL, ok := scmDetails["scmUrl"].(string)
+	if !ok || scmURL == "" {
+		return false
+	}
+
+	// Normalize both URLs for comparison
+	normScmURL := normalizeGitURL(scmURL)
+	normRepoURL := normalizeGitURL(gitInfo.RepoURL)
+
+	// Check if the repository URL is a substring match
+	// This handles cases where URLs might have different schemes or .git suffix
+	return strings.Contains(normScmURL, normRepoURL) || 
+	       strings.Contains(normRepoURL, normScmURL) ||
+	       strings.HasSuffix(normScmURL, "/"+normRepoURL) ||
+	       strings.HasSuffix(normRepoURL, "/"+normScmURL)
 }
 
 // getFailureLogsForExecution retrieves failure logs for a specific execution
