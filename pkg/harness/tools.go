@@ -49,6 +49,7 @@ func InitToolsets(client *client.Client, config *config.Config) (*toolsets.Tools
 	logs := toolsets.NewToolset("logs", "Harness Logs related tools").
 		AddReadTools(
 			toolsets.NewServerTool(DownloadExecutionLogsTool(config, client)),
+			toolsets.NewServerTool(GetPipelineFailureLogsTool(config, client)),
 		)
 
 	// Add toolsets to the group
